@@ -57,6 +57,8 @@ pe32 = ["alloc", "endian_fd"]
 pe64 = ["alloc", "endian_fd"]
 te = ["alloc", "endian_fd"]
 archive = ["alloc"]
+# Debug feature for rewrite module
+debug_rewrite = []
 
 [badges.travis-ci]
 branch = "master"
