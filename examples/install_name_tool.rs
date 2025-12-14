@@ -6,6 +6,7 @@
 //! - `-add_rpath <path>`: Add an rpath
 //! - `-delete_rpath <path>`: Delete an rpath
 //! - `-rpath <old> <new>`: Change an rpath
+//! - `--codesign`: Ad-hoc sign preserving entitlements (like codesign -f -s - --preserve-metadata)
 
 use goblin::mach::writer::modify_fat_binary;
 use std::env;
@@ -22,6 +23,8 @@ fn print_usage() {
     eprintln!("  -delete_rpath <path>    Delete an rpath");
     eprintln!("  -rpath <old> <new>      Change an rpath");
     eprintln!("  -o <output_file>        Write to output file (default: modify in place)");
+    #[cfg(feature = "codesign")]
+    eprintln!("  --codesign              Ad-hoc sign preserving entitlements/requirements");
     eprintln!();
     eprintln!("Multiple options can be combined in a single invocation.");
 }
@@ -46,6 +49,7 @@ fn main() {
     let mut operations: Vec<Operation> = Vec::new();
     let mut input_file: Option<String> = None;
     let mut output_file: Option<String> = None;
+    let mut codesign_preserve = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -108,6 +112,10 @@ fn main() {
                 print_usage();
                 process::exit(0);
             }
+            "--codesign" => {
+                codesign_preserve = true;
+                i += 1;
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("Error: Unknown option: {}", arg);
                 print_usage();
@@ -133,7 +141,7 @@ fn main() {
         }
     };
 
-    if operations.is_empty() {
+    if operations.is_empty() && !codesign_preserve {
         eprintln!("Error: No operations specified");
         print_usage();
         process::exit(1);
@@ -180,23 +188,31 @@ fn main() {
         }
     };
 
-    // Re-sign if the binary was linker-signed (like Apple's install_name_tool does)
-    // Only re-sign if the original binary had the linker-signed flag (0x20000)
-    // Files with just adhoc (0x2) flag are NOT re-signed by Apple
+    // Re-sign based on mode:
+    // - If --codesign: always sign with adhoc_sign_preserving (preserves entitlements)
+    // - Otherwise: only re-sign linker-signed binaries (like Apple's install_name_tool)
     #[cfg(feature = "codesign")]
     let modified = {
-        use goblin::mach::writer::{adhoc_sign, is_linker_signed};
+        use goblin::mach::writer::{adhoc_sign, adhoc_sign_preserving, is_linker_signed};
         use std::path::Path;
 
-        // Only re-sign if the original binary was linker-signed
-        // Check the modified data since that's what we'll sign
-        if is_linker_signed(&modified) {
-            let output_path = output_file.as_ref().unwrap_or(&input_file);
-            let identifier = Path::new(output_path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("a.out");
+        let output_path = output_file.as_ref().unwrap_or(&input_file);
+        let identifier = Path::new(output_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("a.out");
 
+        if codesign_preserve {
+            // User requested explicit codesign with entitlement preservation
+            match adhoc_sign_preserving(modified.clone(), identifier) {
+                Ok(signed) => signed,
+                Err(e) => {
+                    eprintln!("Warning: codesign failed: {}", e);
+                    modified
+                }
+            }
+        } else if is_linker_signed(&modified) {
+            // Auto re-sign linker-signed binaries (like Apple's install_name_tool)
             match adhoc_sign(modified.clone(), identifier) {
                 Ok(signed) => signed,
                 Err(_) => modified,
@@ -205,6 +221,11 @@ fn main() {
             modified
         }
     };
+
+    #[cfg(not(feature = "codesign"))]
+    if codesign_preserve {
+        eprintln!("Warning: --codesign requires the 'codesign' feature");
+    }
 
     // Write output
     let output_path = output_file.as_ref().unwrap_or(&input_file);

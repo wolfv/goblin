@@ -1418,14 +1418,28 @@ where
 // This module implements ad-hoc code signing for Mach-O binaries,
 // matching Apple's install_name_tool behavior for linker-signed binaries.
 
-/// Code signature magic numbers
+/// Code signature magic numbers and slot types
 pub mod codesign_constants {
     /// Magic number for embedded signature SuperBlob
     pub const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade0cc0;
     /// Magic number for CodeDirectory blob
     pub const CSMAGIC_CODEDIRECTORY: u32 = 0xfade0c02;
+    /// Magic number for requirements blob
+    pub const CSMAGIC_REQUIREMENTS: u32 = 0xfade0c01;
+    /// Magic number for entitlements blob (XML plist)
+    pub const CSMAGIC_ENTITLEMENTS: u32 = 0xfade7171;
+    /// Magic number for DER entitlements blob
+    pub const CSMAGIC_DER_ENTITLEMENTS: u32 = 0xfade7172;
+
     /// Slot index for CodeDirectory
     pub const CSSLOT_CODEDIRECTORY: u32 = 0;
+    /// Slot index for requirements
+    pub const CSSLOT_REQUIREMENTS: u32 = 2;
+    /// Slot index for entitlements (XML)
+    pub const CSSLOT_ENTITLEMENTS: u32 = 5;
+    /// Slot index for DER entitlements
+    pub const CSSLOT_DER_ENTITLEMENTS: u32 = 7;
+
     /// SHA-256 hash type
     pub const CS_HASHTYPE_SHA256: u8 = 2;
     /// Ad-hoc signature flag
@@ -1644,6 +1658,367 @@ mod codesign_impl {
         false
     }
 
+    /// Blobs extracted from an existing code signature
+    #[derive(Debug, Default, Clone)]
+    pub struct ExtractedBlobs {
+        /// Requirements blob (CSSLOT_REQUIREMENTS = 2)
+        pub requirements: Option<Vec<u8>>,
+        /// Entitlements blob - XML plist (CSSLOT_ENTITLEMENTS = 5)
+        pub entitlements: Option<Vec<u8>>,
+        /// DER entitlements blob (CSSLOT_DER_ENTITLEMENTS = 7)
+        pub der_entitlements: Option<Vec<u8>>,
+        /// Identifier from the CodeDirectory
+        pub identifier: Option<String>,
+    }
+
+    /// Extract blobs from an existing code signature
+    ///
+    /// This extracts requirements, entitlements, and DER entitlements blobs
+    /// from an existing signature so they can be preserved when re-signing.
+    pub fn extract_signature_blobs(data: &[u8], codesig_offset: usize, codesig_size: usize) -> ExtractedBlobs {
+        let mut blobs = ExtractedBlobs::default();
+
+        if codesig_offset + codesig_size > data.len() || codesig_size < 20 {
+            return blobs;
+        }
+
+        let sig_data = &data[codesig_offset..codesig_offset + codesig_size];
+
+        // Check SuperBlob magic
+        let magic = u32::from_be_bytes([sig_data[0], sig_data[1], sig_data[2], sig_data[3]]);
+        if magic != CSMAGIC_EMBEDDED_SIGNATURE {
+            return blobs;
+        }
+
+        let count = u32::from_be_bytes([sig_data[8], sig_data[9], sig_data[10], sig_data[11]]) as usize;
+
+        // Iterate through blob indices
+        for i in 0..count {
+            let idx_offset = 12 + i * 8;
+            if idx_offset + 8 > sig_data.len() {
+                break;
+            }
+
+            let blob_type = u32::from_be_bytes([
+                sig_data[idx_offset],
+                sig_data[idx_offset + 1],
+                sig_data[idx_offset + 2],
+                sig_data[idx_offset + 3],
+            ]);
+            let blob_offset = u32::from_be_bytes([
+                sig_data[idx_offset + 4],
+                sig_data[idx_offset + 5],
+                sig_data[idx_offset + 6],
+                sig_data[idx_offset + 7],
+            ]) as usize;
+
+            if blob_offset + 8 > sig_data.len() {
+                continue;
+            }
+
+            // Read blob length from the blob header (offset 4 in blob)
+            let blob_len = u32::from_be_bytes([
+                sig_data[blob_offset + 4],
+                sig_data[blob_offset + 5],
+                sig_data[blob_offset + 6],
+                sig_data[blob_offset + 7],
+            ]) as usize;
+
+            if blob_offset + blob_len > sig_data.len() {
+                continue;
+            }
+
+            let blob_data = sig_data[blob_offset..blob_offset + blob_len].to_vec();
+
+            match blob_type {
+                CSSLOT_CODEDIRECTORY => {
+                    // Extract identifier from CodeDirectory
+                    // ident_offset is at byte 20 in the CodeDirectory header (after magic, length, version, flags, hash_offset)
+                    if blob_len > 24 {
+                        let ident_offset = u32::from_be_bytes([
+                            sig_data[blob_offset + 20],
+                            sig_data[blob_offset + 21],
+                            sig_data[blob_offset + 22],
+                            sig_data[blob_offset + 23],
+                        ]) as usize;
+
+                        if ident_offset < blob_len {
+                            // Find null-terminated string
+                            let ident_start = blob_offset + ident_offset;
+                            let mut ident_end = ident_start;
+                            while ident_end < blob_offset + blob_len && sig_data[ident_end] != 0 {
+                                ident_end += 1;
+                            }
+                            if let Ok(id) = core::str::from_utf8(&sig_data[ident_start..ident_end]) {
+                                blobs.identifier = Some(id.to_string());
+                            }
+                        }
+                    }
+                }
+                CSSLOT_REQUIREMENTS => {
+                    blobs.requirements = Some(blob_data);
+                }
+                CSSLOT_ENTITLEMENTS => {
+                    blobs.entitlements = Some(blob_data);
+                }
+                CSSLOT_DER_ENTITLEMENTS => {
+                    blobs.der_entitlements = Some(blob_data);
+                }
+                _ => {}
+            }
+        }
+
+        blobs
+    }
+
+    /// Generate an ad-hoc code signature preserving existing entitlements and requirements
+    ///
+    /// This is equivalent to `codesign -f -s - --preserve-metadata=entitlements,requirements`
+    ///
+    /// If `original_sig_size` is provided, the signature will be padded to match that size
+    /// to keep the binary size unchanged (like Apple's codesign does).
+    pub fn generate_adhoc_signature_preserving(
+        mut data: Vec<u8>,
+        identifier: &str,
+        codesig_cmd_offset: usize,
+        codesig_data_offset: usize,
+        original_sig_size: usize,
+        linkedit_cmd_offset: usize,
+        linkedit_fileoff: u64,
+        text_fileoff: u64,
+        text_filesize: u64,
+        is_64bit: bool,
+        is_executable: bool,
+        preserved_blobs: &ExtractedBlobs,
+    ) -> error::Result<Vec<u8>> {
+        // Calculate how many blobs we'll have and the highest special slot
+        let mut blob_count = 1; // CodeDirectory
+        let mut max_special_slot: u32 = 0;
+
+        if preserved_blobs.requirements.is_some() {
+            blob_count += 1;
+            max_special_slot = max_special_slot.max(CSSLOT_REQUIREMENTS);
+        }
+        if preserved_blobs.entitlements.is_some() {
+            blob_count += 1;
+            max_special_slot = max_special_slot.max(CSSLOT_ENTITLEMENTS);
+        }
+        if preserved_blobs.der_entitlements.is_some() {
+            blob_count += 1;
+            max_special_slot = max_special_slot.max(CSSLOT_DER_ENTITLEMENTS);
+        }
+
+        let n_special_slots = max_special_slot as usize;
+        let n_code_slots = (codesig_data_offset + CS_PAGE_SIZE - 1) / CS_PAGE_SIZE;
+
+        // Calculate sizes
+        let id_bytes = identifier.as_bytes();
+        let id_len = id_bytes.len() + 1;
+
+        let superblob_size = 12;
+        let blob_indices_size = blob_count * 8;
+        let codedir_header_size = 88;
+        // Special slot hashes come before code hashes, identifier comes after header
+        let hash_offset = codedir_header_size + id_len + n_special_slots * 32;
+        let codedir_total = hash_offset + n_code_slots * 32;
+
+        // Calculate total blob content size
+        let mut blob_content_size = superblob_size + blob_indices_size + codedir_total;
+        if let Some(ref req) = preserved_blobs.requirements {
+            blob_content_size += req.len();
+        }
+        if let Some(ref ent) = preserved_blobs.entitlements {
+            blob_content_size += ent.len();
+        }
+        if let Some(ref der) = preserved_blobs.der_entitlements {
+            blob_content_size += der.len();
+        }
+
+        // Apple aligns code signature datasize to 8 bytes
+        // If original_sig_size is provided, use it to keep the binary size unchanged
+        let min_padded_size = (blob_content_size + 7) & !7;
+        let padded_sig_size = if original_sig_size > 0 && original_sig_size >= min_padded_size {
+            original_sig_size
+        } else {
+            min_padded_size
+        };
+
+        // Calculate blob offsets
+        let mut current_offset = superblob_size + blob_indices_size;
+        let codedir_offset = current_offset;
+        current_offset += codedir_total;
+
+        let requirements_offset = if preserved_blobs.requirements.is_some() {
+            let off = current_offset;
+            current_offset += preserved_blobs.requirements.as_ref().unwrap().len();
+            Some(off)
+        } else {
+            None
+        };
+
+        let entitlements_offset = if preserved_blobs.entitlements.is_some() {
+            let off = current_offset;
+            current_offset += preserved_blobs.entitlements.as_ref().unwrap().len();
+            Some(off)
+        } else {
+            None
+        };
+
+        let der_entitlements_offset = if preserved_blobs.der_entitlements.is_some() {
+            Some(current_offset)
+        } else {
+            None
+        };
+
+        // Update LC_CODE_SIGNATURE command FIRST (before hashing)
+        let datasize_offset = codesig_cmd_offset + 12;
+        data[datasize_offset..datasize_offset + 4]
+            .copy_from_slice(&(padded_sig_size as u32).to_le_bytes());
+
+        // Update __LINKEDIT segment filesize
+        let new_linkedit_filesize =
+            codesig_data_offset as u64 + padded_sig_size as u64 - linkedit_fileoff;
+        if is_64bit {
+            let filesize_offset = linkedit_cmd_offset + 48;
+            data[filesize_offset..filesize_offset + 8]
+                .copy_from_slice(&new_linkedit_filesize.to_le_bytes());
+        } else {
+            let filesize_offset = linkedit_cmd_offset + 36;
+            data[filesize_offset..filesize_offset + 4]
+                .copy_from_slice(&(new_linkedit_filesize as u32).to_le_bytes());
+        }
+
+        // Build signature blob
+        let mut sig = Vec::with_capacity(padded_sig_size);
+
+        // SuperBlob header
+        let superblob = SuperBlob {
+            magic: CSMAGIC_EMBEDDED_SIGNATURE,
+            length: blob_content_size as u32,
+            count: blob_count as u32,
+        };
+        sig.extend_from_slice(&superblob.to_bytes());
+
+        // Blob indices - must be in order by slot type
+        sig.extend_from_slice(&BlobIndex {
+            typ: CSSLOT_CODEDIRECTORY,
+            offset: codedir_offset as u32,
+        }.to_bytes());
+
+        if let Some(off) = requirements_offset {
+            sig.extend_from_slice(&BlobIndex {
+                typ: CSSLOT_REQUIREMENTS,
+                offset: off as u32,
+            }.to_bytes());
+        }
+        if let Some(off) = entitlements_offset {
+            sig.extend_from_slice(&BlobIndex {
+                typ: CSSLOT_ENTITLEMENTS,
+                offset: off as u32,
+            }.to_bytes());
+        }
+        if let Some(off) = der_entitlements_offset {
+            sig.extend_from_slice(&BlobIndex {
+                typ: CSSLOT_DER_ENTITLEMENTS,
+                offset: off as u32,
+            }.to_bytes());
+        }
+
+        // CodeDirectory - note: hash_offset is relative to start of CodeDirectory
+        // but we need to account for special slot hashes that come BEFORE code hashes
+        // The identifier comes right after the header, then special hashes, then code hashes
+        let codedir = CodeDirectory {
+            magic: CSMAGIC_CODEDIRECTORY,
+            length: codedir_total as u32,
+            version: CS_VERSION,
+            flags: CS_ADHOC, // Don't set CS_LINKER_SIGNED for preserved signatures
+            hash_offset: hash_offset as u32,
+            ident_offset: codedir_header_size as u32,
+            n_special_slots: n_special_slots as u32,
+            n_code_slots: n_code_slots as u32,
+            code_limit: codesig_data_offset as u32,
+            hash_size: 32,
+            hash_type: CS_HASHTYPE_SHA256,
+            _pad1: 0,
+            page_size: CS_PAGE_SIZE_LOG2,
+            _pad2: 0,
+            scatter_offset: 0,
+            team_offset: 0,
+            _pad3: 0,
+            code_limit64: 0,
+            exec_seg_base: text_fileoff,
+            exec_seg_limit: text_filesize,
+            exec_seg_flags: if is_executable {
+                CS_EXECSEG_MAIN_BINARY
+            } else {
+                0
+            },
+        };
+        sig.extend_from_slice(&codedir.to_bytes());
+
+        // Identifier (null-terminated)
+        sig.extend_from_slice(id_bytes);
+        sig.push(0);
+
+        // Special slot hashes (stored in reverse order: slot -N first, then -N+1, etc.)
+        // We need to fill all slots from 1 to max_special_slot, with zeros for unused slots
+        let mut special_hashes = vec![[0u8; 32]; n_special_slots];
+
+        if let Some(ref req) = preserved_blobs.requirements {
+            let mut hasher = Sha256::new();
+            hasher.update(req);
+            let hash: [u8; 32] = hasher.finalize().into();
+            special_hashes[CSSLOT_REQUIREMENTS as usize - 1] = hash;
+        }
+        if let Some(ref ent) = preserved_blobs.entitlements {
+            let mut hasher = Sha256::new();
+            hasher.update(ent);
+            let hash: [u8; 32] = hasher.finalize().into();
+            special_hashes[CSSLOT_ENTITLEMENTS as usize - 1] = hash;
+        }
+        if let Some(ref der) = preserved_blobs.der_entitlements {
+            let mut hasher = Sha256::new();
+            hasher.update(der);
+            let hash: [u8; 32] = hasher.finalize().into();
+            special_hashes[CSSLOT_DER_ENTITLEMENTS as usize - 1] = hash;
+        }
+
+        // Write special hashes in reverse order (highest slot first)
+        for hash in special_hashes.iter().rev() {
+            sig.extend_from_slice(hash);
+        }
+
+        // Code page hashes (calculated AFTER updating load commands)
+        let mut hasher = Sha256::new();
+        let mut offset = 0;
+        while offset < codesig_data_offset {
+            let end = core::cmp::min(offset + CS_PAGE_SIZE, codesig_data_offset);
+            hasher.update(&data[offset..end]);
+            sig.extend_from_slice(&hasher.finalize_reset());
+            offset = end;
+        }
+
+        // Preserved blobs
+        if let Some(ref req) = preserved_blobs.requirements {
+            sig.extend_from_slice(req);
+        }
+        if let Some(ref ent) = preserved_blobs.entitlements {
+            sig.extend_from_slice(ent);
+        }
+        if let Some(ref der) = preserved_blobs.der_entitlements {
+            sig.extend_from_slice(der);
+        }
+
+        // Padding
+        sig.resize(padded_sig_size, 0);
+
+        // Write signature
+        data.resize(codesig_data_offset + padded_sig_size, 0);
+        data[codesig_data_offset..].copy_from_slice(&sig);
+
+        Ok(data)
+    }
+
     /// Generate an ad-hoc code signature for a Mach-O binary
     ///
     /// # Arguments
@@ -1786,7 +2161,10 @@ mod codesign_impl {
 }
 
 #[cfg(feature = "codesign")]
-pub use codesign_impl::{generate_adhoc_signature, is_linker_signed};
+pub use codesign_impl::{
+    extract_signature_blobs, generate_adhoc_signature, generate_adhoc_signature_preserving,
+    is_linker_signed, ExtractedBlobs,
+};
 
 /// Sign a Mach-O binary with an ad-hoc signature
 ///
@@ -1881,6 +2259,266 @@ pub fn adhoc_sign(data: Vec<u8>, identifier: &str) -> error::Result<Vec<u8>> {
         is_64bit,
         is_executable,
     )
+}
+
+/// Sign a Mach-O binary with an ad-hoc signature, preserving existing entitlements and requirements
+///
+/// This is equivalent to running:
+/// ```sh
+/// codesign -f -s - --preserve-metadata=entitlements,requirements <binary>
+/// ```
+///
+/// # Arguments
+/// * `data` - The Mach-O binary data (can be a single Mach-O or a fat/universal binary)
+/// * `identifier` - The identifier to embed in the signature (typically the filename)
+///
+/// # Returns
+/// The signed binary data with preserved entitlements/requirements, or an error if signing failed
+#[cfg(feature = "codesign")]
+pub fn adhoc_sign_preserving(data: Vec<u8>, identifier: &str) -> error::Result<Vec<u8>> {
+    use crate::mach::fat::{FAT_MAGIC, FAT_MAGIC_64};
+
+    // Check if this is a fat binary
+    if data.len() >= 8 {
+        let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        if magic == FAT_MAGIC || magic == FAT_MAGIC_64 {
+            return adhoc_sign_preserving_fat(data, identifier);
+        }
+    }
+
+    // Single Mach-O binary
+    adhoc_sign_preserving_single(data, identifier)
+}
+
+/// Sign a single (non-fat) Mach-O binary with entitlement preservation
+#[cfg(feature = "codesign")]
+fn adhoc_sign_preserving_single(data: Vec<u8>, identifier: &str) -> error::Result<Vec<u8>> {
+    use crate::mach::header::Header;
+    use crate::mach::parse_magic_and_ctx;
+
+    // Parse header
+    let (_, ctx_opt) = parse_magic_and_ctx(&data, 0)?;
+    let ctx = ctx_opt.ok_or(error::Error::Malformed("Invalid Mach-O magic".into()))?;
+    let header: Header = data.pread_with(0, ctx)?;
+    let is_64bit = ctx.container == container::Container::Big;
+    let header_size = Header::size_with(&ctx);
+
+    // Parse load commands to find what we need
+    let mut codesig_cmd_offset = None;
+    let mut codesig_data_offset = 0usize;
+    let mut codesig_data_size = 0usize;
+    let mut linkedit_cmd_offset = None;
+    let mut linkedit_fileoff = 0u64;
+    let mut text_fileoff = 0u64;
+    let mut text_filesize = 0u64;
+
+    let mut offset = header_size;
+    for _ in 0..header.ncmds {
+        let cmd: u32 = data.pread_with(offset, ctx.le)?;
+        let cmdsize: u32 = data.pread_with(offset + 4, ctx.le)?;
+
+        if cmd == LC_CODE_SIGNATURE {
+            codesig_cmd_offset = Some(offset);
+            let dataoff: u32 = data.pread_with(offset + 8, ctx.le)?;
+            let datasize: u32 = data.pread_with(offset + 12, ctx.le)?;
+            codesig_data_offset = dataoff as usize;
+            codesig_data_size = datasize as usize;
+        } else if cmd == LC_SEGMENT_64 {
+            let segname_bytes = &data[offset + 8..offset + 24];
+            let segname = core::str::from_utf8(segname_bytes)
+                .unwrap_or("")
+                .trim_end_matches('\0');
+
+            if segname == "__LINKEDIT" {
+                linkedit_cmd_offset = Some(offset);
+                linkedit_fileoff = data.pread_with(offset + 32 + 8, ctx.le)?;
+            } else if segname == "__TEXT" {
+                text_fileoff = data.pread_with(offset + 32 + 8, ctx.le)?;
+                text_filesize = data.pread_with(offset + 32 + 16, ctx.le)?;
+            }
+        } else if cmd == LC_SEGMENT {
+            let segname_bytes = &data[offset + 8..offset + 24];
+            let segname = core::str::from_utf8(segname_bytes)
+                .unwrap_or("")
+                .trim_end_matches('\0');
+
+            if segname == "__LINKEDIT" {
+                linkedit_cmd_offset = Some(offset);
+                linkedit_fileoff = data.pread_with::<u32>(offset + 28 + 4, ctx.le)? as u64;
+            } else if segname == "__TEXT" {
+                text_fileoff = data.pread_with::<u32>(offset + 28 + 4, ctx.le)? as u64;
+                text_filesize = data.pread_with::<u32>(offset + 28 + 8, ctx.le)? as u64;
+            }
+        }
+
+        offset += cmdsize as usize;
+    }
+
+    let codesig_cmd_offset = codesig_cmd_offset
+        .ok_or_else(|| error::Error::Malformed("No LC_CODE_SIGNATURE found".into()))?;
+    let linkedit_cmd_offset = linkedit_cmd_offset
+        .ok_or_else(|| error::Error::Malformed("No __LINKEDIT segment found".into()))?;
+
+    // Check if this is a main executable (MH_EXECUTE = 2)
+    let is_executable = header.filetype == 2;
+
+    // Extract existing blobs from the signature
+    let preserved_blobs = codesign_impl::extract_signature_blobs(&data, codesig_data_offset, codesig_data_size);
+
+    // Note: Apple's codesign --preserve-metadata=entitlements,requirements does NOT preserve
+    // the identifier - it generates a new one based on the filename. So we use the passed-in identifier.
+
+    codesign_impl::generate_adhoc_signature_preserving(
+        data,
+        identifier,
+        codesig_cmd_offset,
+        codesig_data_offset,
+        codesig_data_size,
+        linkedit_cmd_offset,
+        linkedit_fileoff,
+        text_fileoff,
+        text_filesize,
+        is_64bit,
+        is_executable,
+        &preserved_blobs,
+    )
+}
+
+/// Sign a fat/universal binary with entitlement preservation
+#[cfg(feature = "codesign")]
+fn adhoc_sign_preserving_fat(data: Vec<u8>, identifier: &str) -> error::Result<Vec<u8>> {
+    use crate::mach::fat::{FatArch, FatArch64, FatHeader, SIZEOF_FAT_ARCH_64, FAT_MAGIC_64};
+
+    let header: FatHeader = data.pread_with(0, scroll::BE)?;
+    let is_64bit_fat = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) == FAT_MAGIC_64;
+
+    let mut output = Vec::new();
+
+    // Write fat header
+    let mut header_bytes = [0u8; mem::size_of::<FatHeader>()];
+    header_bytes.pwrite_with(header, 0, scroll::BE)?;
+    output.extend_from_slice(&header_bytes);
+
+    // Process each architecture
+    let mut arch_data: Vec<(Vec<u8>, u32)> = Vec::new(); // (signed_data, align)
+
+    if is_64bit_fat {
+        for i in 0..header.nfat_arch {
+            let arch_offset = mem::size_of::<FatHeader>() + i as usize * SIZEOF_FAT_ARCH_64;
+            let arch: FatArch64 = data.pread_with(arch_offset, scroll::BE)?;
+
+            let start = arch.offset as usize;
+            let end = start + arch.size as usize;
+            if end > data.len() {
+                return Err(error::Error::Malformed("FatArch64 offset/size out of bounds".into()));
+            }
+
+            let slice_data = data[start..end].to_vec();
+            let signed = adhoc_sign_preserving_single(slice_data, identifier)?;
+            arch_data.push((signed, arch.align));
+        }
+
+        // Calculate new offsets and write arch headers
+        let mut current_offset = mem::size_of::<FatHeader>() + header.nfat_arch as usize * SIZEOF_FAT_ARCH_64;
+
+        for (signed_data, align) in &arch_data {
+            // Align to architecture's requirement
+            let alignment = 1usize << *align;
+            current_offset = (current_offset + alignment - 1) & !(alignment - 1);
+
+            // Read cputype/cpusubtype from the signed slice
+            let cputype: u32 = signed_data.pread_with(4, scroll::LE)?;
+            let cpusubtype: u32 = signed_data.pread_with(8, scroll::LE)?;
+
+            let arch = FatArch64 {
+                cputype,
+                cpusubtype,
+                offset: current_offset as u64,
+                size: signed_data.len() as u64,
+                align: *align,
+                reserved: 0,
+            };
+
+            let mut arch_bytes = [0u8; SIZEOF_FAT_ARCH_64];
+            arch_bytes.pwrite_with(arch, 0, scroll::BE)?;
+            output.extend_from_slice(&arch_bytes);
+
+            current_offset += signed_data.len();
+        }
+
+        // Write signed slices with padding
+        let mut current_offset = mem::size_of::<FatHeader>() + header.nfat_arch as usize * SIZEOF_FAT_ARCH_64;
+        for (signed_data, align) in &arch_data {
+            let alignment = 1usize << *align;
+            let aligned_offset = (current_offset + alignment - 1) & !(alignment - 1);
+
+            // Pad to aligned offset
+            while output.len() < aligned_offset {
+                output.push(0);
+            }
+
+            output.extend_from_slice(signed_data);
+            current_offset = aligned_offset + signed_data.len();
+        }
+    } else {
+        // 32-bit fat header
+        for i in 0..header.nfat_arch {
+            let arch_offset = mem::size_of::<FatHeader>() + i as usize * mem::size_of::<FatArch>();
+            let arch: FatArch = data.pread_with(arch_offset, scroll::BE)?;
+
+            let start = arch.offset as usize;
+            let end = start + arch.size as usize;
+            if end > data.len() {
+                return Err(error::Error::Malformed("FatArch offset/size out of bounds".into()));
+            }
+
+            let slice_data = data[start..end].to_vec();
+            let signed = adhoc_sign_preserving_single(slice_data, identifier)?;
+            arch_data.push((signed, arch.align));
+        }
+
+        // Calculate new offsets and write arch headers
+        let mut current_offset = mem::size_of::<FatHeader>() + header.nfat_arch as usize * mem::size_of::<FatArch>();
+
+        for (signed_data, align) in &arch_data {
+            let alignment = 1usize << *align;
+            current_offset = (current_offset + alignment - 1) & !(alignment - 1);
+
+            // Read cputype/cpusubtype from the signed slice
+            let cputype: u32 = signed_data.pread_with(4, scroll::LE)?;
+            let cpusubtype: u32 = signed_data.pread_with(8, scroll::LE)?;
+
+            let arch = FatArch {
+                cputype,
+                cpusubtype,
+                offset: current_offset as u32,
+                size: signed_data.len() as u32,
+                align: *align,
+            };
+
+            let mut arch_bytes = [0u8; mem::size_of::<FatArch>()];
+            arch_bytes.pwrite_with(arch, 0, scroll::BE)?;
+            output.extend_from_slice(&arch_bytes);
+
+            current_offset += signed_data.len();
+        }
+
+        // Write signed slices with padding
+        let mut current_offset = mem::size_of::<FatHeader>() + header.nfat_arch as usize * mem::size_of::<FatArch>();
+        for (signed_data, align) in &arch_data {
+            let alignment = 1usize << *align;
+            let aligned_offset = (current_offset + alignment - 1) & !(alignment - 1);
+
+            while output.len() < aligned_offset {
+                output.push(0);
+            }
+
+            output.extend_from_slice(signed_data);
+            current_offset = aligned_offset + signed_data.len();
+        }
+    }
+
+    Ok(output)
 }
 
 #[cfg(test)]
