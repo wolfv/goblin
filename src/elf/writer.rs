@@ -672,7 +672,7 @@ impl<'a> ElfWriter<'a> {
             } else {
                 0x2Cusize
             };
-            if self.ctx.le {
+            if self.ctx.le.is_little() {
                 let phnum_bytes = (new_ph_count as u16).to_le_bytes();
                 output[phnum_offset] = phnum_bytes[0];
                 output[phnum_offset + 1] = phnum_bytes[1];
